@@ -75,6 +75,11 @@ class PaymentController extends Controller
      * GET /payment/callback
      *
      * DGePay redirects here after payment.
+     *
+     * SECURITY: The callback arrives via the customer's browser and cannot be
+     * trusted on its own. A payment is only marked completed after DGePay's API
+     * (getTransactionStatus) confirms a successful status for this order at the
+     * amount we stored. Only the verified server data is recorded.
      */
     public function callback(Request $request)
     {
@@ -97,13 +102,19 @@ class PaymentController extends Controller
         Log::warning('DGePay callback', $result);
 
         if (! $result['is_success']) {
-            $status = $result['is_cancelled'] ? 'cancelled' : 'failed';
-
+            // The callback is unverified, so it must not change the order on its own either.
+            // Only close the order if DGePay confirms it was cancelled; otherwise leave it
+            // pending so a genuine payment can still be credited.
             if ($result['unique_txn_id']) {
-                DB::table('payments')
-                    ->where('order_id', $result['unique_txn_id'])
-                    ->where('status', 'pending')
-                    ->update(['status' => $status, 'updated_at' => now()]);
+                $statusCheck = $this->dgepay->getTransactionStatus($result['unique_txn_id']);
+
+                if (($statusCheck['success'] ?? false) === true
+                    && DgePay::isCancelledStatus((string) ($statusCheck['data']['status_code'] ?? ''))) {
+                    DB::table('payments')
+                        ->where('order_id', $result['unique_txn_id'])
+                        ->where('status', 'pending')
+                        ->update(['status' => 'cancelled', 'updated_at' => now()]);
+                }
             }
 
             $msg = $result['is_cancelled']
@@ -113,10 +124,11 @@ class PaymentController extends Controller
             return redirect()->route('payment.plans')->with('error', $msg);
         }
 
-        // Find the pending payment
+        // Find the open payment ('pending_review' orders can still be completed by a
+        // later callback, since every verification check below runs again)
         $payment = DB::table('payments')
             ->where('order_id', $result['unique_txn_id'])
-            ->where('status', 'pending')
+            ->whereIn('status', ['pending', 'pending_review'])
             ->first();
 
         if (! $payment) {
@@ -124,23 +136,92 @@ class PaymentController extends Controller
                 ->with('error', 'Payment record not found. Contact support.');
         }
 
-        // Verify with DGePay API for security
-        $statusCheck = $this->dgepay->getTransactionStatus($result['unique_txn_id']);
-        $verifiedData = $statusCheck['data'] ?? $callbackParams;
-        $trxId = $verifiedData['txn_number'] ?? $result['txn_number'];
+        $orderId = $payment->order_id;
 
-        // Activate the payment
-        DB::table('payments')
-            ->where('order_id', $result['unique_txn_id'])
+        // Verify server-to-server with DGePay. Never credit based on the callback alone.
+        $statusCheck = $this->dgepay->getTransactionStatus($orderId);
+
+        if (($statusCheck['success'] ?? false) !== true || ! is_array($statusCheck['data'] ?? null)) {
+            // Could not verify (network/API error). The customer may have paid, so hold for review.
+            return $this->rejectUnverifiedPayment($orderId, 'pending_review', 'Status check failed', [
+                'message' => $statusCheck['message'] ?? null,
+            ]);
+        }
+
+        $verified = $statusCheck['data'];
+
+        if (! DgePay::isSuccessStatus((string) ($verified['status_code'] ?? ''))) {
+            // Only a confirmed cancellation is final; any other status (e.g. still processing) needs review.
+            $status = DgePay::isCancelledStatus((string) ($verified['status_code'] ?? '')) ? 'cancelled' : 'pending_review';
+
+            return $this->rejectUnverifiedPayment($orderId, $status, 'DGePay did not confirm success', [
+                'status_code' => $verified['status_code'] ?? null,
+                'message'     => $verified['message'] ?? null,
+            ]);
+        }
+
+        if ((string) ($verified['unique_txn_id'] ?? '') !== (string) $orderId) {
+            return $this->rejectUnverifiedPayment($orderId, 'pending_review', 'Verified unique_txn_id mismatch', [
+                'verified_unique_txn_id' => $verified['unique_txn_id'] ?? null,
+            ]);
+        }
+
+        // Compare the verified amount with what we stored for this order (in paisa, to avoid float issues).
+        if (! is_numeric($verified['amount'] ?? null)
+            || $this->toMinorUnits($verified['amount']) !== $this->toMinorUnits($payment->amount)) {
+            return $this->rejectUnverifiedPayment($orderId, 'pending_review', 'Verified amount mismatch', [
+                'expected_amount' => $payment->amount,
+                'verified_amount' => $verified['amount'] ?? null,
+            ]);
+        }
+
+        $trxId = (string) ($verified['txn_number'] ?? '');
+
+        // Activate the payment using ONLY verified server data.
+        // The status guard makes this idempotent if the callback is replayed.
+        $updated = DB::table('payments')
+            ->where('order_id', $orderId)
+            ->whereIn('status', ['pending', 'pending_review'])
             ->update([
                 'status'     => 'completed',
                 'trx_id'     => $trxId,
-                'gateway'    => $result['payment_method'],
+                'gateway'    => (string) ($verified['payment_method'] ?? ''),
+                'amount'     => $verified['amount'],
                 'updated_at' => now(),
             ]);
 
+        if ($updated === 0) {
+            return redirect()->route('payment.plans')
+                ->with('error', "Payment record not found. Contact support with your order ID: {$orderId}");
+        }
+
         return redirect()->route('payment.success')
             ->with('success', "Payment successful! Transaction: {$trxId}");
+    }
+
+    /**
+     * Mark a pending payment as not completed after verification failed,
+     * log it, and send the customer to support with their order ID.
+     */
+    protected function rejectUnverifiedPayment(string $orderId, string $status, string $reason, array $context = [])
+    {
+        DB::table('payments')
+            ->where('order_id', $orderId)
+            ->whereIn('status', ['pending', 'pending_review'])
+            ->update(['status' => $status, 'updated_at' => now()]);
+
+        Log::error("DGePay payment verification failed: {$reason}", ['order_id' => $orderId, 'status' => $status] + $context);
+
+        return redirect()->route('payment.plans')
+            ->with('error', "We couldn't confirm your payment. Please contact support with your order ID: {$orderId}");
+    }
+
+    /**
+     * Convert a taka amount to integer paisa for exact comparison.
+     */
+    protected function toMinorUnits(mixed $amount): int
+    {
+        return (int) round(((float) $amount) * 100);
     }
 
     /**

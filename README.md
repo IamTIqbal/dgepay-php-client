@@ -262,20 +262,32 @@ $decrypted = $dgepay->decryptCallbackData($rawData);
 $result = $dgepay->parseCallbackResult($decrypted ?? $_GET);
 
 if ($result['is_success']) {
-    // Payment successful!
-    $orderId   = $result['unique_txn_id'];  // Your order ID
-    $txnNumber = $result['txn_number'];     // DGePay txn number
-    $method    = $result['payment_method']; // "bKash", "Nagad", etc.
+    // The callback only CLAIMS success. Do not credit anything yet.
+    $orderId      = $result['unique_txn_id'];
+    $storedAmount = $order->amount; // the amount YOU saved for $orderId when initiating
 
-    // RECOMMENDED: Verify with API before activating
-    $status = $dgepay->getTransactionStatus($orderId);
-    if ($status['success'] && $status['data']['status_code'] == 3) {
-        // Verified! Activate the order.
+    // Step 4 (REQUIRED): Verify server-to-server with DGePay
+    $status   = $dgepay->getTransactionStatus($orderId);
+    $verified = $status['data'] ?? [];
+
+    $isVerified = ($status['success'] ?? false) === true
+        && DgePay::isSuccessStatus((string) ($verified['status_code'] ?? ''))
+        && (string) ($verified['unique_txn_id'] ?? '') === (string) $orderId
+        && is_numeric($verified['amount'] ?? null)
+        && (int) round($verified['amount'] * 100) === (int) round($storedAmount * 100);
+
+    if ($isVerified) {
+        // Activate the order using ONLY verified data:
+        $txnNumber = $verified['txn_number'] ?? '';     // DGePay txn number
+        $method    = $verified['payment_method'] ?? ''; // "bKash", "Nagad", etc.
+    } else {
+        // Do NOT activate. Mark for review, log, and ask the customer to contact support.
     }
 } elseif ($result['is_cancelled']) {
-    // User cancelled
+    // User cancelled. This is also unverified: only close the order if
+    // getTransactionStatus() confirms DgePay::isCancelledStatus().
 } else {
-    // Payment failed
+    // Payment not completed. Leave the order pending and reconcile via getTransactionStatus().
 }
 ```
 
@@ -495,7 +507,7 @@ DGePay's JavaScript SDK references endpoints like `/payment/initiate` which retu
 
 ## Security Notes
 
-- **Always verify callbacks server-side** — Don't trust the callback data alone. Call `getTransactionStatus()` to verify with DGePay's API before activating orders.
+- **Always verify callbacks server-side** — The callback reaches you through the customer's browser, so `parseCallbackResult()` can't prove a payment happened. Before activating an order, call `getTransactionStatus()` and require: `success === true`, `DgePay::isSuccessStatus()` on the returned `status_code`, a matching `unique_txn_id`, and an `amount` equal to what you stored for that order. Record only the verified response data. If any check fails, don't activate the order.
 - **AES-128-ECB limitation** — ECB mode doesn't use an IV and identical plaintext blocks produce identical ciphertext. This is DGePay's requirement, not a choice. Don't reuse this pattern in your own systems.
 - **Protect your credentials** — Never commit `client_id`, `client_secret`, or `client_api_key` to version control. Use environment variables.
 

@@ -314,6 +314,23 @@ class DgePay
      *
      * Handles both encrypted (?data=...) and plain query-param callbacks.
      *
+     * SECURITY WARNING: This result must NEVER be trusted on its own.
+     * This method only reads the parameters it is given. It does not
+     * authenticate them. The callback reaches your server through the
+     * customer's browser, and a plain (non-encrypted) query-param callback
+     * is not signed, so anyone can construct one that reports success.
+     *
+     * Before crediting an order, marking it paid, or granting access, you MUST
+     * confirm the payment server-to-server with getTransactionStatus() and check:
+     *   - the returned 'success' is true,
+     *   - DgePay::isSuccessStatus() on the returned data['status_code'],
+     *   - data['unique_txn_id'] matches your order, and
+     *   - data['amount'] matches the amount you stored for that order.
+     * Record only the verified response data (txn_number, payment_method,
+     * amount), not the values returned here.
+     *
+     * Use 'is_success' only to decide whether to run that verification.
+     *
      * @param array $params The callback parameters (decrypted or raw query params).
      *
      * @return array{

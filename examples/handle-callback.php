@@ -11,6 +11,9 @@
  *
  * CRITICAL: PHP's query string parsing converts '+' to spaces.
  * You must restore '+' before decryption.
+ *
+ * SECURITY: Never trust the callback on its own. Always confirm it with
+ * getTransactionStatus() (status AND amount) before crediting an order.
  */
 
 require_once __DIR__ . '/../vendor/autoload.php';
@@ -44,29 +47,54 @@ if (isset($_GET['data'])) {
 $result = $dgepay->parseCallbackResult($callbackParams);
 
 if ($result['is_success']) {
-    // Payment successful!
-    $orderId    = $result['unique_txn_id']; // Your original order ID
-    $txnNumber  = $result['txn_number'];    // DGePay transaction number
-    $method     = $result['payment_method']; // "bKash", "Nagad", etc.
+    // The callback CLAIMS success. It is not trusted until DGePay's API confirms it.
+    $orderId = $result['unique_txn_id']; // Your original order ID
 
-    // Verify with DGePay API (recommended for security)
+    // Load the amount YOU stored for this order when initiating the payment:
+    //   SELECT amount FROM payments WHERE order_id = ? AND status = 'pending'
+    $storedAmount = 100.00; // placeholder: replace with your DB lookup
+
+    // REQUIRED: verify server-to-server with DGePay before crediting anything
     $statusCheck = $dgepay->getTransactionStatus($orderId);
+    $verified    = is_array($statusCheck['data'] ?? null) ? $statusCheck['data'] : [];
 
-    if ($statusCheck['success'] && ($statusCheck['data']['status_code'] ?? '') == '3') {
-        // Double-verified! Update your database:
-        //   UPDATE payments SET status = 'completed', trx_id = ? WHERE order_id = ?
-        echo "Payment successful! Transaction: {$txnNumber}, Method: {$method}";
+    $isVerified = ($statusCheck['success'] ?? false) === true
+        && DgePay::isSuccessStatus((string) ($verified['status_code'] ?? ''))
+        && (string) ($verified['unique_txn_id'] ?? '') === (string) $orderId
+        && is_numeric($verified['amount'] ?? null)
+        && (int) round((float) $verified['amount'] * 100) === (int) round((float) $storedAmount * 100);
+
+    if ($isVerified) {
+        // Use ONLY the verified server data, never the callback params
+        $txnNumber = (string) ($verified['txn_number'] ?? '');     // DGePay transaction number
+        $method    = (string) ($verified['payment_method'] ?? ''); // "bKash", "Nagad", etc.
+
+        //   UPDATE payments SET status = 'completed', trx_id = ?, gateway = ?
+        //   WHERE order_id = ? AND status = 'pending'
+        echo 'Payment successful! Transaction: ' . htmlspecialchars($txnNumber, ENT_QUOTES)
+            . ', Method: ' . htmlspecialchars($method, ENT_QUOTES);
     } else {
-        echo "Payment verification failed. Contact support.";
+        // Never mark completed here. Hold for review and log the details:
+        //   UPDATE payments SET status = 'pending_review' WHERE order_id = ? AND status = 'pending'
+        error_log('DGePay verification failed for order ' . $orderId . ': ' . json_encode([
+            'success'       => $statusCheck['success'] ?? null,
+            'message'       => $statusCheck['message'] ?? $verified['message'] ?? null,
+            'status_code'   => $verified['status_code'] ?? null,
+            'unique_txn_id' => $verified['unique_txn_id'] ?? null,
+            'amount'        => $verified['amount'] ?? null,
+        ]));
+        echo "We couldn't confirm your payment. Please contact support with your order ID: "
+            . htmlspecialchars($orderId, ENT_QUOTES);
     }
 
 } elseif ($result['is_cancelled']) {
-    // User cancelled the payment
-    //   UPDATE payments SET status = 'cancelled' WHERE order_id = ?
+    // The callback says cancelled, but it is unverified too. Only close the order if
+    // getTransactionStatus() confirms DgePay::isCancelledStatus(); otherwise leave it pending.
+    //   UPDATE payments SET status = 'cancelled' WHERE order_id = ? AND status = 'pending'
     echo "Payment was cancelled.";
 
 } else {
-    // Payment failed
-    //   UPDATE payments SET status = 'failed' WHERE order_id = ?
-    echo "Payment failed: " . ($result['message'] ?: 'Unknown error');
+    // Payment not completed. Don't change the order based on this unverified callback;
+    // leave it pending and reconcile later with getTransactionStatus().
+    echo 'Payment failed: ' . htmlspecialchars($result['message'] ?: 'Unknown error', ENT_QUOTES);
 }
